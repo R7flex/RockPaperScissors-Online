@@ -37,6 +37,8 @@ cd RockPaperScissors-Online
 3. Install dependencies:
 ```bash
 npm install
+cd frontend
+npm install
 ```
 
 4. Start the development server:
