@@ -10,6 +10,13 @@ A real-time multiplayer Rock Paper Scissors game built with React. Challenge you
 - Responsive design for all devices
 - Simple and intuitive controls
 
+ ## 🎮 Game Screenshots
+
+<div align="center">
+  <img src="./images/screen1.png" alt="Screen 1" width="250"/>
+  <img src="./images/screen2.png" alt="Screen 2" width="250"/>
+</div>
+
 ## 🚀 Live Demo
 
 Soon
