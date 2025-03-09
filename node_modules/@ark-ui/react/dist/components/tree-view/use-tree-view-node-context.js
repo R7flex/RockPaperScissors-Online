@@ -1,0 +1,12 @@
+'use client';
+import { createContext } from '../../utils/create-context.js';
+
+const [TreeViewNodeProvider, useTreeViewNodeContext] = createContext(
+  {
+    name: "TreeViewNodeContext",
+    hookName: "useTreeViewNodeContext",
+    providerName: "<TreeViewNodeProvider />"
+  }
+);
+
+export { TreeViewNodeProvider, useTreeViewNodeContext };

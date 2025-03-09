@@ -1,0 +1,561 @@
+import { createAnatomy } from '@zag-js/anatomy';
+import { createScope, dataAttr, isSelfTarget, contains, visuallyHiddenStyle, addDomEvent, raf, getEventTarget } from '@zag-js/dom-query';
+import { formatBytes } from '@zag-js/i18n-utils';
+import { createProps } from '@zag-js/types';
+import { getAcceptAttrString, isFileEqual, isValidFileType, isValidFileSize } from '@zag-js/file-utils';
+import { createMachine, ref } from '@zag-js/core';
+import { createSplitProps, compact, callAll } from '@zag-js/utils';
+
+// src/file-upload.anatomy.ts
+var anatomy = createAnatomy("file-upload").parts(
+  "root",
+  "dropzone",
+  "item",
+  "itemDeleteTrigger",
+  "itemGroup",
+  "itemName",
+  "itemPreview",
+  "itemPreviewImage",
+  "itemSizeText",
+  "label",
+  "trigger",
+  "clearTrigger"
+);
+var parts = anatomy.build();
+var dom = createScope({
+  getRootId: (ctx) => ctx.ids?.root ?? `file:${ctx.id}`,
+  getDropzoneId: (ctx) => ctx.ids?.dropzone ?? `file:${ctx.id}:dropzone`,
+  getHiddenInputId: (ctx) => ctx.ids?.hiddenInput ?? `file:${ctx.id}:input`,
+  getTriggerId: (ctx) => ctx.ids?.trigger ?? `file:${ctx.id}:trigger`,
+  getLabelId: (ctx) => ctx.ids?.label ?? `file:${ctx.id}:label`,
+  getItemId: (ctx, id) => ctx.ids?.item?.(id) ?? `file:${ctx.id}:item:${id}`,
+  getItemNameId: (ctx, id) => ctx.ids?.itemName?.(id) ?? `file:${ctx.id}:item-name:${id}`,
+  getItemSizeTextId: (ctx, id) => ctx.ids?.itemSizeText?.(id) ?? `file:${ctx.id}:item-size:${id}`,
+  getItemPreviewId: (ctx, id) => ctx.ids?.itemPreview?.(id) ?? `file:${ctx.id}:item-preview:${id}`,
+  getRootEl: (ctx) => dom.getById(ctx, dom.getRootId(ctx)),
+  getHiddenInputEl: (ctx) => dom.getById(ctx, dom.getHiddenInputId(ctx)),
+  getDropzoneEl: (ctx) => dom.getById(ctx, dom.getDropzoneId(ctx))
+});
+function isEventWithFiles(event) {
+  const target = getEventTarget(event);
+  if (!event.dataTransfer) return !!target && "files" in target;
+  return event.dataTransfer.types.some((type) => {
+    return type === "Files" || type === "application/x-moz-file";
+  });
+}
+function isFilesWithinRange(ctx, incomingCount) {
+  if (!ctx.multiple && incomingCount > 1) return false;
+  if (!ctx.multiple && incomingCount + ctx.acceptedFiles.length === 2) return true;
+  if (incomingCount + ctx.acceptedFiles.length > ctx.maxFiles) return false;
+  return true;
+}
+function getFilesFromEvent(ctx, files) {
+  const acceptedFiles = [];
+  const rejectedFiles = [];
+  files.forEach((file) => {
+    const [accepted, acceptError] = isValidFileType(file, ctx.acceptAttr);
+    const [sizeMatch, sizeError] = isValidFileSize(file, ctx.minFileSize, ctx.maxFileSize);
+    const validateErrors = ctx.validate?.(file, {
+      acceptedFiles: ctx.acceptedFiles,
+      rejectedFiles: ctx.rejectedFiles
+    });
+    const valid = validateErrors ? validateErrors.length === 0 : true;
+    if (accepted && sizeMatch && valid) {
+      acceptedFiles.push(file);
+    } else {
+      const errors = [acceptError, sizeError];
+      if (!valid) errors.push(...validateErrors ?? []);
+      rejectedFiles.push({ file, errors: errors.filter(Boolean) });
+    }
+  });
+  if (!isFilesWithinRange(ctx, acceptedFiles.length)) {
+    acceptedFiles.forEach((file) => {
+      rejectedFiles.push({ file, errors: ["TOO_MANY_FILES"] });
+    });
+    acceptedFiles.splice(0);
+  }
+  return {
+    acceptedFiles,
+    rejectedFiles
+  };
+}
+
+// src/file-upload.connect.ts
+function connect(state, send, normalize) {
+  const disabled = state.context.disabled;
+  const allowDrop = state.context.allowDrop;
+  const translations = state.context.translations;
+  const dragging = state.matches("dragging");
+  const focused = state.matches("focused") && !disabled;
+  return {
+    dragging,
+    focused,
+    disabled: !!disabled,
+    openFilePicker() {
+      if (disabled) return;
+      send("OPEN");
+    },
+    deleteFile(file) {
+      send({ type: "FILE.DELETE", file });
+    },
+    acceptedFiles: state.context.acceptedFiles,
+    rejectedFiles: state.context.rejectedFiles,
+    setFiles(files) {
+      const count = files.length;
+      send({ type: "FILES.SET", files, count });
+    },
+    clearRejectedFiles() {
+      send({ type: "REJECTED_FILES.CLEAR" });
+    },
+    clearFiles() {
+      send({ type: "FILES.CLEAR" });
+    },
+    getFileSize(file) {
+      return formatBytes(file.size, state.context.locale);
+    },
+    createFileUrl(file, cb) {
+      const win = dom.getWin(state.context);
+      const url = win.URL.createObjectURL(file);
+      cb(url);
+      return () => win.URL.revokeObjectURL(url);
+    },
+    setClipboardFiles(dt) {
+      if (disabled) return false;
+      const items = Array.from(dt?.items ?? []);
+      const files = items.reduce((acc, item) => {
+        if (item.kind !== "file") return acc;
+        const file = item.getAsFile();
+        if (!file) return acc;
+        return [...acc, file];
+      }, []);
+      if (!files.length) return false;
+      send({ type: "FILES.SET", files });
+      return true;
+    },
+    getRootProps() {
+      return normalize.element({
+        ...parts.root.attrs,
+        dir: state.context.dir,
+        id: dom.getRootId(state.context),
+        "data-disabled": dataAttr(disabled),
+        "data-dragging": dataAttr(dragging)
+      });
+    },
+    getDropzoneProps(props2 = {}) {
+      return normalize.element({
+        ...parts.dropzone.attrs,
+        dir: state.context.dir,
+        id: dom.getDropzoneId(state.context),
+        tabIndex: disabled || props2.disableClick ? void 0 : 0,
+        role: props2.disableClick ? "application" : "button",
+        "aria-label": translations.dropzone,
+        "aria-disabled": disabled,
+        "data-invalid": dataAttr(state.context.invalid),
+        "data-disabled": dataAttr(disabled),
+        "data-dragging": dataAttr(dragging),
+        onKeyDown(event) {
+          if (disabled) return;
+          if (event.defaultPrevented) return;
+          if (!isSelfTarget(event)) return;
+          if (props2.disableClick) return;
+          if (event.key !== "Enter" && event.key !== " ") return;
+          send({ type: "DROPZONE.CLICK", src: "keydown" });
+        },
+        onClick(event) {
+          if (disabled) return;
+          if (event.defaultPrevented) return;
+          if (props2.disableClick) return;
+          if (!isSelfTarget(event)) return;
+          if (event.currentTarget.localName === "label") {
+            event.preventDefault();
+          }
+          send("DROPZONE.CLICK");
+        },
+        onDragOver(event) {
+          if (disabled) return;
+          if (!allowDrop) return;
+          event.preventDefault();
+          event.stopPropagation();
+          try {
+            event.dataTransfer.dropEffect = "copy";
+          } catch {
+          }
+          const hasFiles = isEventWithFiles(event);
+          if (!hasFiles) return;
+          const count = event.dataTransfer.items.length;
+          send({ type: "DROPZONE.DRAG_OVER", count });
+        },
+        onDragLeave(event) {
+          if (disabled) return;
+          if (!allowDrop) return;
+          if (contains(event.currentTarget, event.relatedTarget)) return;
+          send({ type: "DROPZONE.DRAG_LEAVE" });
+        },
+        onDrop(event) {
+          if (disabled) return;
+          if (allowDrop) {
+            event.preventDefault();
+            event.stopPropagation();
+          }
+          const hasFiles = isEventWithFiles(event);
+          if (disabled || !hasFiles) return;
+          send({ type: "DROPZONE.DROP", files: Array.from(event.dataTransfer.files) });
+        },
+        onFocus() {
+          if (disabled) return;
+          send("DROPZONE.FOCUS");
+        },
+        onBlur() {
+          if (disabled) return;
+          send("DROPZONE.BLUR");
+        }
+      });
+    },
+    getTriggerProps() {
+      return normalize.button({
+        ...parts.trigger.attrs,
+        dir: state.context.dir,
+        id: dom.getTriggerId(state.context),
+        disabled,
+        "data-disabled": dataAttr(disabled),
+        "data-invalid": dataAttr(state.context.invalid),
+        type: "button",
+        onClick(event) {
+          if (disabled) return;
+          if (contains(dom.getDropzoneEl(state.context), event.currentTarget)) {
+            event.stopPropagation();
+          }
+          send("OPEN");
+        }
+      });
+    },
+    getHiddenInputProps() {
+      return normalize.input({
+        id: dom.getHiddenInputId(state.context),
+        tabIndex: -1,
+        disabled,
+        type: "file",
+        required: state.context.required,
+        capture: state.context.capture,
+        name: state.context.name,
+        accept: state.context.acceptAttr,
+        webkitdirectory: state.context.directory ? "" : void 0,
+        multiple: state.context.multiple || state.context.maxFiles > 1,
+        onClick(event) {
+          event.stopPropagation();
+          event.currentTarget.value = "";
+        },
+        onInput(event) {
+          if (disabled) return;
+          const { files } = event.currentTarget;
+          send({ type: "FILES.SET", files: files ? Array.from(files) : [] });
+        },
+        style: visuallyHiddenStyle
+      });
+    },
+    getItemGroupProps() {
+      return normalize.element({
+        ...parts.itemGroup.attrs,
+        dir: state.context.dir,
+        "data-disabled": dataAttr(disabled)
+      });
+    },
+    getItemProps(props2) {
+      const { file } = props2;
+      return normalize.element({
+        ...parts.item.attrs,
+        dir: state.context.dir,
+        id: dom.getItemId(state.context, file.name),
+        "data-disabled": dataAttr(disabled)
+      });
+    },
+    getItemNameProps(props2) {
+      const { file } = props2;
+      return normalize.element({
+        ...parts.itemName.attrs,
+        dir: state.context.dir,
+        id: dom.getItemNameId(state.context, file.name),
+        "data-disabled": dataAttr(disabled)
+      });
+    },
+    getItemSizeTextProps(props2) {
+      const { file } = props2;
+      return normalize.element({
+        ...parts.itemSizeText.attrs,
+        dir: state.context.dir,
+        id: dom.getItemSizeTextId(state.context, file.name),
+        "data-disabled": dataAttr(disabled)
+      });
+    },
+    getItemPreviewProps(props2) {
+      const { file } = props2;
+      return normalize.element({
+        ...parts.itemPreview.attrs,
+        dir: state.context.dir,
+        id: dom.getItemPreviewId(state.context, file.name),
+        "data-disabled": dataAttr(disabled)
+      });
+    },
+    getItemPreviewImageProps(props2) {
+      const { file, url } = props2;
+      const isImage = file.type.startsWith("image/");
+      if (!isImage) {
+        throw new Error("Preview Image is only supported for image files");
+      }
+      return normalize.img({
+        ...parts.itemPreviewImage.attrs,
+        alt: translations.itemPreview?.(file),
+        src: url,
+        "data-disabled": dataAttr(disabled)
+      });
+    },
+    getItemDeleteTriggerProps(props2) {
+      const { file } = props2;
+      return normalize.button({
+        ...parts.itemDeleteTrigger.attrs,
+        dir: state.context.dir,
+        type: "button",
+        disabled,
+        "data-disabled": dataAttr(disabled),
+        "aria-label": translations.deleteFile?.(file),
+        onClick() {
+          if (disabled) return;
+          send({ type: "FILE.DELETE", file });
+        }
+      });
+    },
+    getLabelProps() {
+      return normalize.label({
+        ...parts.label.attrs,
+        dir: state.context.dir,
+        id: dom.getLabelId(state.context),
+        htmlFor: dom.getHiddenInputId(state.context),
+        "data-disabled": dataAttr(disabled)
+      });
+    },
+    getClearTriggerProps() {
+      return normalize.button({
+        ...parts.clearTrigger.attrs,
+        dir: state.context.dir,
+        type: "button",
+        disabled,
+        hidden: state.context.acceptedFiles.length === 0,
+        "data-disabled": dataAttr(disabled),
+        onClick(event) {
+          if (event.defaultPrevented) return;
+          if (disabled) return;
+          send({ type: "FILES.CLEAR" });
+        }
+      });
+    }
+  };
+}
+function machine(userContext) {
+  const ctx = compact(userContext);
+  return createMachine(
+    {
+      id: "fileupload",
+      initial: "idle",
+      context: {
+        minFileSize: 0,
+        maxFileSize: Number.POSITIVE_INFINITY,
+        maxFiles: 1,
+        allowDrop: true,
+        accept: ctx.accept,
+        preventDocumentDrop: true,
+        ...ctx,
+        acceptedFiles: ref([]),
+        rejectedFiles: ref([]),
+        translations: {
+          dropzone: "dropzone",
+          itemPreview: (file) => `preview of ${file.name}`,
+          deleteFile: (file) => `delete file ${file.name}`,
+          ...ctx.translations
+        }
+      },
+      computed: {
+        acceptAttr: (ctx2) => getAcceptAttrString(ctx2.accept),
+        multiple: (ctx2) => ctx2.maxFiles > 1
+      },
+      watch: {
+        acceptedFiles: ["syncInputElement"]
+      },
+      on: {
+        "FILES.SET": {
+          actions: ["setFilesFromEvent"]
+        },
+        "FILE.DELETE": {
+          actions: ["removeFile"]
+        },
+        "FILES.CLEAR": {
+          actions: ["clearFiles"]
+        },
+        "REJECTED_FILES.CLEAR": {
+          actions: ["clearRejectedFiles"]
+        }
+      },
+      activities: ["preventDocumentDrop"],
+      states: {
+        idle: {
+          on: {
+            OPEN: {
+              actions: ["openFilePicker"]
+            },
+            "DROPZONE.CLICK": {
+              actions: ["openFilePicker"]
+            },
+            "DROPZONE.FOCUS": "focused",
+            "DROPZONE.DRAG_OVER": "dragging"
+          }
+        },
+        focused: {
+          on: {
+            "DROPZONE.BLUR": "idle",
+            OPEN: {
+              actions: ["openFilePicker"]
+            },
+            "DROPZONE.CLICK": {
+              actions: ["openFilePicker"]
+            },
+            "DROPZONE.DRAG_OVER": "dragging"
+          }
+        },
+        dragging: {
+          on: {
+            "DROPZONE.DROP": {
+              target: "idle",
+              actions: ["setFilesFromEvent"]
+            },
+            "DROPZONE.DRAG_LEAVE": "idle"
+          }
+        }
+      }
+    },
+    {
+      activities: {
+        preventDocumentDrop(ctx2) {
+          if (!ctx2.preventDocumentDrop) return;
+          if (!ctx2.allowDrop) return;
+          if (ctx2.disabled) return;
+          const doc = dom.getDoc(ctx2);
+          const onDragOver = (event) => {
+            event?.preventDefault();
+          };
+          const onDrop = (event) => {
+            if (contains(dom.getRootEl(ctx2), getEventTarget(event))) return;
+            event.preventDefault();
+          };
+          return callAll(addDomEvent(doc, "dragover", onDragOver, false), addDomEvent(doc, "drop", onDrop, false));
+        }
+      },
+      actions: {
+        syncInputElement(ctx2) {
+          queueMicrotask(() => {
+            const inputEl = dom.getHiddenInputEl(ctx2);
+            if (!inputEl) return;
+            const win = dom.getWin(ctx2);
+            const dataTransfer = new win.DataTransfer();
+            ctx2.acceptedFiles.forEach((v) => {
+              dataTransfer.items.add(v);
+            });
+            inputEl.files = dataTransfer.files;
+            inputEl.dispatchEvent(new win.Event("change", { bubbles: true }));
+          });
+        },
+        openFilePicker(ctx2) {
+          raf(() => {
+            dom.getHiddenInputEl(ctx2)?.click();
+          });
+        },
+        setFilesFromEvent(ctx2, evt) {
+          const result = getFilesFromEvent(ctx2, evt.files);
+          const { acceptedFiles, rejectedFiles } = result;
+          if (ctx2.multiple) {
+            const files = ref([...ctx2.acceptedFiles, ...acceptedFiles]);
+            set.files(ctx2, files, rejectedFiles);
+            return;
+          }
+          if (acceptedFiles.length) {
+            const files = ref([acceptedFiles[0]]);
+            set.files(ctx2, files, rejectedFiles);
+          } else if (rejectedFiles.length) {
+            set.files(ctx2, ctx2.acceptedFiles, rejectedFiles);
+          }
+        },
+        removeFile(ctx2, evt) {
+          const files = Array.from(ctx2.acceptedFiles.filter((file) => file !== evt.file));
+          const rejectedFiles = Array.from(ctx2.rejectedFiles.filter((item) => item.file !== evt.file));
+          ctx2.acceptedFiles = ref(files);
+          ctx2.rejectedFiles = ref(rejectedFiles);
+          invoke.change(ctx2);
+        },
+        clearRejectedFiles(ctx2) {
+          ctx2.rejectedFiles = ref([]);
+          invoke.change(ctx2);
+        },
+        clearFiles(ctx2) {
+          ctx2.acceptedFiles = ref([]);
+          ctx2.rejectedFiles = ref([]);
+          invoke.change(ctx2);
+        }
+      },
+      compareFns: {
+        acceptedFiles: (a, b) => a.length === b.length && a.every((file, i) => isFileEqual(file, b[i]))
+      }
+    }
+  );
+}
+var invoke = {
+  change: (ctx) => {
+    ctx.onFileChange?.({
+      acceptedFiles: ctx.acceptedFiles,
+      rejectedFiles: ctx.rejectedFiles
+    });
+  },
+  accept: (ctx) => {
+    ctx.onFileAccept?.({ files: ctx.acceptedFiles });
+  },
+  reject: (ctx) => {
+    ctx.onFileReject?.({ files: ctx.rejectedFiles });
+  }
+};
+var set = {
+  files: (ctx, acceptedFiles, rejectedFiles) => {
+    ctx.acceptedFiles = ref(acceptedFiles);
+    invoke.accept(ctx);
+    if (rejectedFiles) {
+      ctx.rejectedFiles = ref(rejectedFiles);
+      invoke.reject(ctx);
+    }
+    invoke.change(ctx);
+  }
+};
+var props = createProps()([
+  "accept",
+  "allowDrop",
+  "capture",
+  "dir",
+  "directory",
+  "disabled",
+  "getRootNode",
+  "id",
+  "ids",
+  "locale",
+  "maxFiles",
+  "maxFileSize",
+  "minFileSize",
+  "name",
+  "invalid",
+  "onFileAccept",
+  "onFileReject",
+  "onFileChange",
+  "preventDocumentDrop",
+  "required",
+  "translations",
+  "validate"
+]);
+var splitProps = createSplitProps(props);
+var itemProps = createProps()(["file"]);
+var splitItemProps = createSplitProps(itemProps);
+
+export { anatomy, connect, itemProps, machine, props, splitItemProps, splitProps };
